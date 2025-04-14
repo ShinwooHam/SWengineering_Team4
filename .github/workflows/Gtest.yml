@@ -1,0 +1,176 @@
+name: CI via Repository Dispatch (Multi-repo + Static Analysis)
+
+on:
+  repository_dispatch:
+    types: [trigger-ci]
+
+jobs:
+  external-ci:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Print incoming info
+        run: |
+          echo "🔗 Repository: ${{ github.event.client_payload.repository }}"
+          echo "🔀 Commit SHA: ${{ github.event.client_payload.commit_sha }}"
+
+      - name: Clone appropriate repo
+        run: |
+          git clone https://${{ secrets.PERSONAL_TOKEN }}@github.com/${{ github.event.client_payload.repository }} repo-temp
+          mv repo-temp/source-code ./source-code
+          mv repo-temp/sonar-project.properties ./sonar-project.properties
+
+      - name: Debug CMakeLists
+        run: |
+          echo "📂 source-code 폴더 목록"
+          ls -al source-code
+      
+      - name: Set up dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake cppcheck clang-tidy libgtest-dev python3-pip jq gcovr
+          sudo snap install gh --classic
+
+      - name: Install Google Test
+        run: |
+          cd /usr/src/gtest
+          sudo cmake .
+          sudo make
+          sudo cp lib/*.a /usr/lib
+          
+      - name: Download build-wrapper
+        run: |
+          curl -sSLo build-wrapper-linux-x86.zip https://sonarcloud.io/static/cpp/build-wrapper-linux-x86.zip
+          unzip build-wrapper-linux-x86.zip
+  
+      - name: Build inside build-wrapper
+        run: |
+          mkdir build
+          cd build
+          cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_CXX_FLAGS="--coverage -O0" ../source-code
+          ls -al   # Makefile 생성됐는지 확인
+          ../build-wrapper-linux-x86/build-wrapper-linux-x86-64 --out-dir ../bw-output make VERBOSE=1
+
+
+      - name: Build & Run Tests with Coverage
+        run: |
+          cd build
+          make VERBOSE=1
+          ctest --output-on-failure || true
+
+      - name: Generate coverage report (gcovr)
+        run: |
+          mkdir -p coverage
+          gcovr -r source-code \
+                --exclude source-code/test \
+                --sonarqube \
+                -o coverage/coverage.xml
+
+      - name: Show coverage report summary
+        run: |
+          echo "📈 coverage.xml 생성 결과:"
+          head -n 20 coverage/coverage.xml || echo "❌ coverage.xml 없음"
+
+      - name: 🔎 커버리지 디버깅(.gc* 파일 목록)
+        run: find build -name "*.gc*" || echo "❌ gcov 관련 파일 없음"
+      
+      - name: 📄 테스트 실행 로그 확인
+        run: cat build/Testing/Temporary/LastTest.log || echo "❌ 테스트 로그 없음"
+        
+      
+      - name: Debug build artifacts and build-wrapper output
+        run: |
+          echo "📁 build 디렉토리 파일 목록"
+          find build -type f || echo "build 디렉토리 없음"
+      
+          echo "📁 bw-output 디렉토리 확인"
+          find bw-output -type f || echo "bw-output 디렉토리 없음"
+
+
+      - name: Run cppcheck
+        run: |
+          cppcheck --enable=all --inconclusive --std=c++17 --language=c++ \
+                   -I source-code/include \
+                   source-code/src 2> cppcheck-report.txt
+          
+      - name: Display cppcheck output
+        run: cat cppcheck-report.txt
+
+
+      - name: Link compile_commands.json
+        run: |
+          ln -s $(pwd)/build/compile_commands.json source-code/compile_commands.json
+          
+      - name: Run clang-tidy (with output)
+        run: |
+          echo "🔍 clang-tidy 실행 중"
+          mkdir -p clang-tidy-report
+          find source-code -name '*.cpp' | while read file; do
+            echo "🧩 검사 중: $file"
+            clang-tidy "$file" -p build >> clang-tidy-report/report.txt 2>&1 || true
+          done
+
+      - name: Show clang-tidy results
+        run: |
+          echo "📄 clang-tidy 분석 결과:"
+          cat clang-tidy-report/report.txt || echo "❌ 결과 없음"
+
+
+      - name: Download sonar-scanner
+        run: |
+          curl -sSLo sonar-scanner.zip https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
+          unzip sonar-scanner.zip
+          mv sonar-scanner-* sonar-scanner
+  
+      - name: Check for sonar-project.properties
+        run: |
+          echo "📁 현재 디렉토리: $(pwd)"
+          echo "🔍 루트에 있는 설정파일 확인:"
+          ls -al sonar-project.properties || echo "❌ sonar-project.properties 없음"
+
+      - name: Run SonarCloud scanner manually
+        run: |
+          sonar-scanner/bin/sonar-scanner \
+            -Dsonar.token=${{ secrets.SONAR_TOKEN }} \
+            -Dsonar.coverageReportPaths=coverage/coverage.xml \
+            -Dsonar.scm.provider=git \
+            -Dsonar.cfamily.compile-commands=build/compile_commands.json
+            
+      - name: Fetch SonarCloud issues (all types)
+        run: |
+          curl -s -u ${{ secrets.SONAR_TOKEN }}: \
+            "https://sonarcloud.io/api/issues/search?projectKeys=yoona96_Dev-Sample-Repo&resolved=false&pageSize=500" \
+            -o sonar-issues.json
+
+      - name: Create consolidated GitHub issue with Markdown table
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "📄 이슈 테이블 생성 중..."
+          
+          echo "| 유형 | 심각도 | 파일 | 라인 | 설명 |" > issue-body.md
+          echo "|------|--------|------|------|------|" >> issue-body.md
+
+          jq -r '
+            .issues[] |
+            "| \(.type) | \(.severity) | \(.component | sub(".*src/"; "")) | \(.line // "N/A") | \(.message | gsub("[\r\n]"; " ")) |"
+          ' sonar-issues.json >> issue-body.md
+
+          issue_count=$(cat issue-body.md | wc -l)
+          echo "🔢 총 이슈 수: $((issue_count - 2))"
+
+          if [[ $issue_count -gt 2 ]]; then
+            gh issue create \
+              --title "📊 SonarCloud 정적 분석 요약 보고서" \
+              --body "$(cat issue-body.md)"
+          else
+            echo "✅ 이슈가 없으므로 생성하지 않습니다."
+          fi
+
+      - name: Print all SonarCloud issues to console
+        run: |
+          echo "📋 SonarCloud 이슈 목록 (모든 심각도, 모든 유형)"
+          jq -r '
+            .issues[] |
+            "[\(.severity)] [\(.type)] \(.message)\n  ↪ File: \(.component | sub(".*src/"; "")) | Line: \(.line // "N/A") | Key: \(.key)\n"
+          ' sonar-issues.json
